@@ -1,0 +1,650 @@
+﻿@using DBChatAI.Blazor.Server.Helpers
+@using DBChatAI.Blazor.Server.Services
+@using DBChatAI.Blazor.Server.Services.Interface
+@using DBChatAI.Module.BusinessObjects.AI
+@using DevExpress.AIIntegration.Blazor.Chat
+@using DevExpress.ExpressApp
+@using DevExpress.ExpressApp.Security
+@using DevExpress.Persistent.BaseImpl.PermissionPolicy
+@using Markdig
+@using Microsoft.Extensions.AI
+@using System.Data
+@using Microsoft.Extensions.Configuration
+
+@inject IAiChatService AiChatService
+@inject IDbSchemaProvider SchemaProvider
+@inject ISafeSqlExecutor SqlExecutor
+@inject ISecurityStrategyBase SecurityStrategy
+@inject IConfiguration Configuration
+
+<DxAIChat CssClass="ai-db-chat"
+          UseStreaming="true"
+          ResponseContentFormat="ResponseContentFormat.Markdown"
+          Initialized="OnChatInitialized"
+          MessageSent="OnMessageSent">
+    <MessageContentTemplate>
+        @((MarkupString)Markdown.ToHtml(context.Content, Pipeline))
+    </MessageContentTemplate>
+</DxAIChat>
+
+@code {
+    [Parameter] public AiChatModel Model { get; set; } = default!;
+
+    static MarkdownPipeline Pipeline = new MarkdownPipelineBuilder()
+        .UseAdvancedExtensions() // enable tables
+        .Build();
+
+    // Limits for rows/columns in the returned table (loaded from configuration)
+    int MaxResultRows { get; set; } = 100;
+    int MaxResultColumns { get; set; } = 20;
+
+    IAIChat _chat;
+    string _schemaSummary;
+
+    // Chat state for this session
+    bool _isFirstQuestion = true;
+    AiChatSession _currentSession;
+
+    protected override void OnInitialized()
+    {
+        base.OnInitialized();
+
+        // Load limits from appsettings (fallback to defaults if missing or invalid)
+        if (int.TryParse(Configuration["DBAIChat:MaxResultRows"], out var maxRows) && maxRows > 0)
+        {
+            MaxResultRows = maxRows;
+        }
+
+        if (int.TryParse(Configuration["DBAIChat:MaxResultColumns"], out var maxCols) && maxCols > 0)
+        {
+            MaxResultColumns = maxCols;
+        }
+
+        _schemaSummary = SchemaProvider.GetSchemaSummary();
+    }
+
+    void OnChatInitialized(IAIChat chat)
+    {
+        _chat = chat;
+        var systemMsg = "I am an AI assistant for your database. Ask me a question about your data.";
+
+        chat.LoadMessages(new[] {
+            new BlazorChatMessage(ChatRole.Assistant, systemMsg)
+        });
+    }
+
+    async Task OnMessageSent(MessageSentEventArgs args)
+    {
+        var question = args.Content;
+
+        var os = Model.ObjectSpace;
+        if (os == null)
+        {
+            await args.Chat.SendMessage("ObjectSpace not available.", ChatRole.Assistant);
+            return;
+        }
+
+        // Current XAF user
+        var securityUser = (PermissionPolicyUser)SecurityStrategy.User;
+        var currentUser = os.GetObject(securityUser);
+
+        // Create a new session on the first question
+        if (_currentSession == null)
+        {
+            _currentSession = os.CreateObject<AiChatSession>();
+            _currentSession.Owner = currentUser;
+            _currentSession.CreatedOn = DateTime.Now;
+
+            // Temporary title: use the first question, truncated if necessary
+            var shortQuestion = question.Length <= 50 ? question : question.Substring(0, 50) + "...";
+            _currentSession.Title = $"Chat: {shortQuestion}";
+
+            os.CommitChanges();
+        }
+
+
+        // Log user message
+        var userMsg = os.CreateObject<AiMessage>();
+        userMsg.AiChatSession = _currentSession;
+        userMsg.Role = AiMessageRole.User;
+        userMsg.Content = question;
+        userMsg.CreatedOn = DateTime.Now;
+        os.CommitChanges();
+
+        // History for the model:
+        // - On the first question: no history
+        // - After that: messages from the current session
+        IEnumerable<AiMessage> historyForModel =
+            _isFirstQuestion
+                ? Enumerable.Empty<AiMessage>()
+                : _currentSession.Messages.ToList();
+
+        _isFirstQuestion = false;
+
+
+        // 1) Retrieve last SQL query in this session
+        var lastSql = _currentSession.Messages
+            .Where(m => !string.IsNullOrWhiteSpace(m.SqlQuery))
+            .OrderByDescending(m => m.CreatedOn)
+            .Select(m => m.SqlQuery)
+            .FirstOrDefault();
+
+        // 2) Detect local command
+        var cmd = SqlUserCommandHelper.DetectUserCommand(question);
+
+        // 3) If this is a local command and we have a previous SQL → handle locally
+        if (cmd.Type != UserCommandType.None && !string.IsNullOrWhiteSpace(lastSql))
+        {
+            await HandleLocalCommandAsync(args, os, lastSql, cmd);
+            return; // DO NOT call the AI
+        }
+
+
+
+        AiChatResponse response;
+        try
+        {
+            response = await AiChatService.AskAsync(question, historyForModel, _schemaSummary);
+        }
+        catch (Exception ex)
+        {
+            await args.Chat.SendMessage($"⚠️ Error in AI service: {ex.Message}", ChatRole.Assistant);
+            return;
+        }
+
+
+        UpdateSessionTitleIfNeeded(_currentSession, question, response);
+        os.CommitChanges();
+
+        // Save AI response
+        var aiMsg = os.CreateObject<AiMessage>();
+        aiMsg.AiChatSession = _currentSession;
+        aiMsg.Role = AiMessageRole.Assistant;
+        aiMsg.Content = response.AssistantMessage;
+        aiMsg.SqlQuery = response.ProposedSql;
+        aiMsg.CreatedOn = DateTime.Now;
+        os.CommitChanges();
+
+        // Send text response
+        await args.Chat.SendMessage(response.AssistantMessage, ChatRole.Assistant);
+
+        // If there is SQL, execute and show table
+        if (!string.IsNullOrWhiteSpace(response.ProposedSql))
+        {
+            try
+            {
+                var table = await SqlExecutor.ExecuteSafeSelectAsync(response.ProposedSql);
+
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine("I executed this read-only query:");
+                sb.AppendLine();
+                sb.AppendLine("```sql");
+                sb.AppendLine(response.ProposedSql);
+                sb.AppendLine("```");
+                sb.AppendLine();
+                sb.AppendLine("Here is the result (limited to "
+                    + MaxResultRows + " rows and "
+                    + MaxResultColumns + " columns):");
+                sb.AppendLine();
+                sb.Append(BuildMarkdownTable(table, MaxResultRows, MaxResultColumns));
+
+                await args.Chat.SendMessage(sb.ToString(), ChatRole.Assistant);
+            }
+            catch (Exception ex)
+            {
+                var err = $"The proposed query was not executed: {ex.Message}";
+                await args.Chat.SendMessage(err, ChatRole.Assistant);
+
+                var errMsg = os.CreateObject<AiMessage>();
+                errMsg.AiChatSession = _currentSession;
+                errMsg.Role = AiMessageRole.System;
+                errMsg.Content = err;
+                errMsg.CreatedOn = DateTime.Now;
+                os.CommitChanges();
+            }
+        }
+    }
+
+    string BuildMarkdownTable(DataTable table, int maxRows, int maxColumns)
+    {
+        if (table == null || table.Columns.Count == 0)
+            return "_No data to display._";
+
+        var sb = new System.Text.StringBuilder();
+
+        // Actual determination of rows/columns to show
+        var totalColumns = table.Columns.Count;
+        var totalRows = table.Rows.Count;
+        var visibleColumns = Math.Min(maxColumns, totalColumns);
+        var visibleRows = Math.Min(maxRows, totalRows);
+
+        // Header
+        sb.Append("| ");
+        for (int i = 0; i < visibleColumns; i++)
+        {
+            var col = table.Columns[i];
+            sb.Append(col.ColumnName + " | ");
+        }
+        sb.Append("\n");
+
+        // Separator
+        sb.Append("| ");
+        for (int i = 0; i < visibleColumns; i++)
+        {
+            sb.Append("--- | ");
+        }
+        sb.Append("\n");
+
+        // Rows
+        for (int rowIndex = 0; rowIndex < visibleRows; rowIndex++)
+        {
+            var row = table.Rows[rowIndex];
+            sb.Append("| ");
+            for (int colIndex = 0; colIndex < visibleColumns; colIndex++)
+            {
+                var col = table.Columns[colIndex];
+                var val = row[col]?.ToString() ?? string.Empty;
+                val = val.Replace("|", "\\|");
+                sb.Append(val + " | ");
+            }
+            sb.Append("\n");
+        }
+
+        // Indication that there is more data
+        if (visibleRows < totalRows || visibleColumns < totalColumns)
+        {
+            sb.Append("\n");
+            sb.Append("_Result truncated: ");
+            if (visibleRows < totalRows)
+            {
+                sb.Append($"{visibleRows} of {totalRows} rows shown");
+                if (visibleColumns < totalColumns)
+                {
+                    sb.Append(", ");
+                }
+            }
+
+            if (visibleColumns < totalColumns)
+            {
+                sb.Append($"{visibleColumns} of {totalColumns} columns shown");
+            }
+
+            sb.Append("._");
+        }
+
+        return sb.ToString();
+    }
+
+    // Kept for backward compatibility if needed
+    string BuildMarkdownTable(DataTable table)
+    {
+        return BuildMarkdownTable(table, MaxResultRows, MaxResultColumns);
+    }
+
+    // Used by AiChatDetailViewItemBlazor
+    public static RenderFragment Create(AiChatModel model) => builder =>
+    {
+        builder.OpenComponent<AiChatRenderer>(0);
+        builder.AddAttribute(1, "Model", model);
+        builder.CloseComponent();
+    };
+
+    private void UpdateSessionTitleIfNeeded(AiChatSession session, string question, AiChatResponse response)
+    {
+        if (session == null)
+            return;
+
+        // If the title was already customized before, do not change it
+        if (!string.IsNullOrWhiteSpace(session.Title) &&
+            !session.Title.StartsWith("Chat:", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var newTitle = MakeSessionTitle(question, response?.ProposedSql, response?.AssistantMessage);
+
+        if (!string.IsNullOrWhiteSpace(newTitle))
+        {
+            session.Title = newTitle;
+        }
+    }
+
+    private string MakeSessionTitle(string question, string sql, string answer)
+    {
+        // 1) If there is SQL, try to infer the main table
+        if (!string.IsNullOrWhiteSpace(sql))
+        {
+            var table = ExtractMainTable(sql);
+            if (!string.IsNullOrWhiteSpace(table))
+            {
+                // Some smart keywords
+                if (table.Contains("contratt", StringComparison.OrdinalIgnoreCase))
+                    return "Contract Analysis";
+                if (table.Contains("societ", StringComparison.OrdinalIgnoreCase) ||
+                    table.Contains("client", StringComparison.OrdinalIgnoreCase))
+                    return "Customer / Company Analysis";
+                if (table.Contains("fattur", StringComparison.OrdinalIgnoreCase))
+                    return "Invoice Analysis";
+
+                return $"Analysis {table}";
+            }
+        }
+
+        // 2) If the question is short → use it as title
+        if (!string.IsNullOrWhiteSpace(question) && question.Length <= 60)
+            return question;
+
+        // 3) Fallback: truncate the question
+        if (!string.IsNullOrWhiteSpace(question))
+        {
+            var trimmed = question.Trim();
+            return trimmed.Length <= 60 ? trimmed : trimmed.Substring(0, 60) + "...";
+        }
+
+        // 4) If we really have nothing
+        return "AI database chat";
+    }
+
+    private string ExtractMainTable(string sql)
+    {
+        if (string.IsNullOrWhiteSpace(sql))
+            return null;
+
+        try
+        {
+            var lower = sql.ToLowerInvariant();
+
+            // Look for the first occurrence of " from "
+            var idx = lower.IndexOf(" from ");
+            if (idx < 0)
+                return null;
+
+            var part = sql.Substring(idx + 6).Trim(); // Text after FROM (with original casing)
+
+            // Split by spaces and newlines, take the first word
+            var separators = new[] { ' ', '\r', '\n', '\t' };
+            var firstWord = part.Split(separators, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(firstWord))
+                return null;
+
+            return CleanTableName(firstWord);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string CleanTableName(string table)
+    {
+        if (string.IsNullOrWhiteSpace(table))
+            return table;
+
+        // Remove possible [dbo]., [], simple aliases
+        table = table.Trim();
+
+        // Remove schema like dbo.Societa
+        if (table.Contains("."))
+        {
+            table = table.Split('.')[^1]; // Last part
+        }
+
+        table = table.Replace("[", "").Replace("]", "");
+
+        return table;
+    }
+
+    private async Task HandleLocalCommandAsync(
+    MessageSentEventArgs args,
+    IObjectSpace os,
+    string lastSql,
+    UserCommand cmd)
+    {
+        // Extract current paging info (OFFSET/FETCH).
+        // If there is no paging in the SQL, we assume the first result set
+        // was limited by MaxResultRows in SqlExecutor.
+        var (offset, fetch, hasPaging) =
+            SqlPatchHelper.ExtractOffsetFetch(lastSql, defaultFetch: MaxResultRows);
+
+        string newSql = lastSql;
+        string description = null;
+
+        switch (cmd.Type)
+        {
+
+            case UserCommandType.FirstPage:
+                // Go back to the first page with the current page size (or MaxResultRows).
+                newSql = SqlPatchHelper.ApplyFirstPage(lastSql, fetch);
+                description = $"Showing first page ({fetch} rows).";
+                break;
+
+            case UserCommandType.NextPage:
+                if (cmd.PageSize.HasValue && cmd.PageSize.Value > 0)
+                {
+                    if (hasPaging)
+                    {
+                        // We already have paging (e.g. OFFSET 0 FETCH 100).
+                        // "next 20" means: move after the current chunk and show 20 rows.
+                        // Example:
+                        //   old: OFFSET 0 FETCH 100  -> rows 1-100
+                        //   next 20 -> OFFSET 100 FETCH 20 -> rows 101-120
+                        offset = offset + fetch;
+                        fetch = cmd.PageSize.Value;
+                    }
+                    else
+                    {
+                        // No paging in the SQL.
+                        // The first UI result set showed MaxResultRows rows (1..100).
+                        // So "next 20" should start AFTER those rows.
+                        offset = MaxResultRows;           // 100
+                        fetch = cmd.PageSize.Value;      // e.g. 20
+                    }
+                }
+                else
+                {
+                    // No explicit number: normal "next page".
+                    if (hasPaging)
+                    {
+                        offset = offset + fetch;
+                    }
+                    else
+                    {
+                        // No paging in SQL yet.
+                        // First UI result set was 1..MaxResultRows, so "next page"
+                        // should start from MaxResultRows.
+                        offset = MaxResultRows;
+                    }
+                }
+
+                newSql = SqlPatchHelper.ApplyPaging(lastSql, offset, fetch);
+                description = $"Showing next {fetch} rows (offset {offset}).";
+                break;
+
+            case UserCommandType.PreviousPage:
+                if (cmd.PageSize.HasValue && cmd.PageSize.Value > 0)
+                {
+                    if (hasPaging)
+                    {
+                        // "previous 20" means: go back 20 rows and show 20 rows.
+                        // Example:
+                        //   current: OFFSET 100 FETCH 20 -> rows 101-120
+                        //   previous 20 -> OFFSET 80 FETCH 20 -> rows 81-100
+                        offset = Math.Max(0, offset - cmd.PageSize.Value);
+                        fetch = cmd.PageSize.Value;
+                    }
+                    else
+                    {
+                        // No paging in SQL: safest fallback is "start from the beginning".
+                        offset = 0;
+                        fetch = cmd.PageSize.Value;
+                    }
+                }
+                else
+                {
+                    // "previous page" with current page size.
+                    offset = Math.Max(0, offset - fetch);
+                }
+
+                newSql = SqlPatchHelper.ApplyPaging(lastSql, offset, fetch);
+                description = $"Showing previous {fetch} rows (offset {offset}).";
+                break;
+
+            case UserCommandType.GoToPage:
+                if (cmd.PageNumber.HasValue && cmd.PageNumber.Value > 0)
+                {
+                    int pageSize = fetch > 0 ? fetch : MaxResultRows;
+                    offset = (cmd.PageNumber.Value - 1) * pageSize;
+                    newSql = SqlPatchHelper.ApplyPaging(lastSql, offset, pageSize);
+                    description = $"Showing page {cmd.PageNumber.Value} (offset {offset}, {pageSize} rows).";
+                }
+                break;
+
+            case UserCommandType.ChangePageSize:
+                if (cmd.PageSize.HasValue && cmd.PageSize.Value > 0)
+                {
+                    newSql = SqlPatchHelper.ApplyPageSize(lastSql, cmd.PageSize.Value);
+                    description = $"Changed page size to {cmd.PageSize.Value} rows.";
+                }
+                break;
+
+            case UserCommandType.Sort:
+                if (!string.IsNullOrWhiteSpace(cmd.SortColumn))
+                {
+                    // Optional: resolve friendly name "Birth date" to real column "BirthDate"
+                    var resolvedColumn = SqlColumnResolver.ResolveColumnFromSelect(lastSql, cmd.SortColumn);
+
+                    if (hasPaging)
+                    {
+                        // The last SQL already had paging (OFFSET/FETCH).
+                        // Keep paging and just change ORDER BY.
+                        newSql = SqlPatchHelper.ApplySort(lastSql, resolvedColumn, cmd.SortDirection, offset, fetch);
+                    }
+                    else
+                    {
+                        // The last SQL had NO paging.
+                        // Apply ONLY ORDER BY and let MaxResultRows in SqlExecutor limit the rows.
+                        newSql = SqlPatchHelper.ApplySort(lastSql, resolvedColumn, cmd.SortDirection, null, null);
+                    }
+
+                    description = $"Sorted by {resolvedColumn} ({cmd.SortDirection}).";
+                }
+                break;
+
+
+            case UserCommandType.Filter:
+                if (!string.IsNullOrWhiteSpace(cmd.FilterColumn) &&
+                    !string.IsNullOrWhiteSpace(cmd.FilterValue))
+                {
+                    // 1) Remove existing paging from the last SQL
+                    var withoutPaging = SqlPatchHelper.RemoveOffsetFetch(lastSql);
+
+                    // 2) Apply the new filter on the base SQL
+                    var filtered = SqlPatchHelper.ApplyFilter(
+                        withoutPaging,
+                        cmd.FilterColumn,
+                        cmd.FilterOperator,
+                        cmd.FilterValue);
+
+                    // 3) Reset paging to the first page after applying the filter
+                    offset = 0;
+                    newSql = SqlPatchHelper.ApplyPaging(filtered, offset, fetch);
+
+                    description = $"Applied filter: {cmd.FilterColumn} {cmd.FilterOperator} {cmd.FilterValue}, starting from the first page.";
+                }
+                break;
+
+            case UserCommandType.ClearSorting:
+                // Remove ORDER BY and paging; re-apply paging (same offset/fetch) if we had paging before
+                var withoutOrder = SqlPatchHelper.RemoveOrderByAndPaging(lastSql);
+                if (hasPaging)
+                {
+                    newSql = SqlPatchHelper.ApplyPaging(withoutOrder, offset, fetch);
+                    description = "Cleared sorting while keeping paging.";
+                }
+                else
+                {
+                    newSql = withoutOrder;
+                    description = "Cleared sorting.";
+                }
+                break;
+
+            case UserCommandType.ClearFilters:
+                // Remove WHERE, then reset to the first page
+                var withoutWhere = SqlPatchHelper.RemoveWhereKeepOrderAndPaging(lastSql);
+                offset = 0;
+
+                if (hasPaging)
+                {
+                    newSql = SqlPatchHelper.ApplyPaging(withoutWhere, offset, fetch);
+                }
+                else
+                {
+                    newSql = withoutWhere;
+                }
+
+                description = "Cleared all filters and moved back to the first page.";
+                break;
+
+            case UserCommandType.ClearAll:
+                // Remove WHERE, ORDER BY and paging
+                newSql = SqlPatchHelper.RemoveAllFiltersAndSorting(lastSql);
+                description = "Cleared all filters, sorting, and paging.";
+                break;
+        }
+
+        // Nothing changed
+        if (newSql == lastSql && cmd.Type != UserCommandType.None)
+        {
+            await args.Chat.SendMessage("I was not able to apply that command to the previous query.", ChatRole.Assistant);
+            return;
+        }
+
+        try
+        {
+            // Execute the updated SQL
+            var table = await SqlExecutor.ExecuteSafeSelectAsync(newSql);
+
+            // Log assistant message
+            var aiMsg = os.CreateObject<AiMessage>();
+            aiMsg.AiChatSession = _currentSession;
+            aiMsg.Role = AiMessageRole.Assistant;
+            aiMsg.Content = description ?? "Updated result.";
+            aiMsg.SqlQuery = newSql;
+            aiMsg.CreatedOn = DateTime.Now;
+            os.CommitChanges();
+
+            await args.Chat.SendMessage(aiMsg.Content, ChatRole.Assistant);
+
+            // Send SQL + markdown table
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("Executed the following SQL query:");
+            sb.AppendLine();
+            sb.AppendLine("```sql");
+            sb.AppendLine(newSql);
+            sb.AppendLine("```");
+            sb.AppendLine();
+            sb.AppendLine("Result:");
+            sb.AppendLine();
+            sb.Append(BuildMarkdownTable(table));
+
+            await args.Chat.SendMessage(sb.ToString(), ChatRole.Assistant);
+        }
+        catch (Exception ex)
+        {
+            var err = $"Failed to execute updated SQL: {ex.Message}";
+            await args.Chat.SendMessage(err, ChatRole.Assistant);
+
+            var errMsg = os.CreateObject<AiMessage>();
+            errMsg.AiChatSession = _currentSession;
+            errMsg.Role = AiMessageRole.System;
+            errMsg.Content = err;
+            errMsg.CreatedOn = DateTime.Now;
+            os.CommitChanges();
+        }
+    }
+
+
+
+
+
+}
+
+

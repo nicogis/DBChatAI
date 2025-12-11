@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Application Title="DBChatAI">
+  <BOModel>
+    <Class Name="DBChatAI.Module.BusinessObjects.AI.AiChatHost" Caption="AI Chat" />
+  </BOModel>
+  <Options>
+    <LayoutManagerOptions RequiredFieldMark="*" />
+  </Options>
+  <SchemaModules>
+    <SchemaModule Name="SystemModule" Version="25.1.6.0" IsNewNode="True" />
+  </SchemaModules>
+  <Views>
+    <DetailView Id="AiChatHost_DetailView" AllowDelete="False" AllowEdit="False">
+      <HiddenActions>
+        <ActionLink ActionId="NextObject" IsNewNode="True" />
+        <ActionLink ActionId="PreviousObject" IsNewNode="True" />
+        <ActionLink ActionId="Refresh" IsNewNode="True" />
+        <ActionLink ActionId="Save" IsNewNode="True" />
+        <ActionLink ActionId="SaveAndClose" IsNewNode="True" />
+        <ActionLink ActionId="SaveAndNew" IsNewNode="True" />
+      </HiddenActions>
+    </DetailView>
+  </Views>
+</Application>

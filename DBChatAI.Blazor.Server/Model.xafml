@@ -1,0 +1,30 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Application>
+  <Options UIType="TabbedMDI"
+         RestoreTabbedMdiLayout="True"
+         ShowTabImage="True"
+         VirtualScrollingEnabled="True">
+  </Options>
+  <NavigationItems NavigationStyle="Accordion">
+	  <Items>
+		  <Item Id="Default">
+			  <Items>
+				  <Item Id="AiChatHost" ViewId="AiChatHost_DetailView" ImageName="BO_Department" Caption="Chat AI" IsNewNode="True" />
+			  </Items>
+		  </Item>
+	  </Items>
+  </NavigationItems>
+
+	<Views>
+		<DetailView Id="AiChatHost_DetailView">
+			<Items>
+				<AiChatDetailViewItemBlazor Id="AiChat" IsNewNode="True" />
+			</Items>
+			<Layout>
+				<LayoutGroup Id="Main" IsNewNode="True">
+					<LayoutItem Id="AiChat" ViewItem="AiChat" Index="0" IsNewNode="True" />
+				</LayoutGroup>
+			</Layout>
+		</DetailView>
+	</Views>
+</Application>
