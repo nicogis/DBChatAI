@@ -120,6 +120,42 @@ Markdown table result
 
 ---
 
+📊 Sample Database
+
+This project uses the Microsoft AdventureWorks sample database for demonstration and testing purposes.
+
+AdventureWorks is an official Microsoft sample database designed to showcase SQL Server features and realistic business schemas (Human Resources, Sales, Production, Purchasing, etc.).
+
+Download
+
+You can download the AdventureWorks sample database directly from Microsoft:
+
+👉 https://learn.microsoft.com/en-us/sql/samples/adventureworks-install-configure
+
+Available versions include:
+
+- OLTP
+
+- Data Warehouse
+
+- Lightweight (LT)
+
+For this project, the OLTP version is recommended.
+
+Notes
+
+AdventureWorks is used only as a sample dataset
+
+The project is database-agnostic and can be adapted to:
+
+- custom schemas
+
+- legacy databases
+
+- reporting databases
+
+Column and table names in examples reflect the AdventureWorks schema
+
 ## 🔐 Security Considerations
 
 - Only **SELECT** queries are allowed
