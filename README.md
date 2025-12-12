@@ -35,17 +35,29 @@ This guarantees:
 ## 🧠 Architecture
 
 User (Chat UI)
+
 ↓
+
 DevExpress AI Chat (Blazor)
+
 ↓
+
 Command Detection Engine
+
 ├─ Local command? → SQL patch (paging / sort / filter)
+
 └─ New question? → Azure OpenAI
+
 ↓
+
 SQL generation
+
 ↓
+
 Safe SQL execution
+
 ↓
+
 Markdown table result
 
 
